@@ -15,7 +15,7 @@ from utils.utils import *
 def get_args():
     parser = argparse.ArgumentParser(description='HDR-Transformer',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--dataset_dir", type=str, default='./data',
+    parser.add_argument("--dataset_dir", type=str, default='.C:/Users/24843/Desktop/College/deeplearning/Data',
                         help='dataset directory'),
     parser.add_argument('--patch_size', type=int, default=256),
     parser.add_argument("--sub_set", type=str, default='sig17_training_crop128_stride64',

@@ -41,6 +41,26 @@ def window_reverse(windows, window_size, H, W):
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
+## Gated-Dconv Feed-Forward Network (GDFN)
+class GDFN(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor, bias):
+        super(FeedForward, self).__init__()
+
+        hidden_features = int(dim*ffn_expansion_factor)
+
+        self.project_in = nn.Conv2d(dim, hidden_features*2, kernel_size=1, bias=bias)
+
+        self.dwconv = nn.Conv2d(hidden_features*2, hidden_features*2, kernel_size=3, stride=1, padding=1, groups=hidden_features*2, bias=bias)
+
+        self.project_out = nn.Conv2d(hidden_features, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.project_in(x)
+        x1, x2 = self.dwconv(x).chunk(2, dim=1)
+        x = F.gelu(x1) * x2
+        x = self.project_out(x)
+        return x
+
 ## Multi-DConv Head Transposed Self-Attention (MDTA)
 class MDTA_Attention(nn.Module):
     def __init__(self, dim, num_heads, bias):
@@ -120,7 +140,7 @@ class WindowAttention(nn.Module):
 
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
@@ -207,14 +227,12 @@ class ContextAwareTransformer(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        # self.attn = WindowAttention(
-        #     dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-        #     qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         self.mdta = MDTA_Attention(dim, num_heads=num_heads,bias=qkv_bias)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
+        self.gdfn = GDFN(dim=dim, ffn_expansion_factor=mlp_ratio, bias=qkv_bias)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         if self.shift_size > 0:
@@ -260,35 +278,6 @@ class ContextAwareTransformer(nn.Module):
         # local context features
         lcf = x.permute(0, 3, 1, 2)
 
-        # # cyclic shift
-        # if self.shift_size > 0:
-        #     shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        # else:
-        #     shifted_x = x
-
-        # # partition windows
-        # x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        # x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
-        #
-        # # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
-        # if self.input_resolution == x_size:
-        #     attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
-        # else:
-        #     attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).to(x.device))
-        #
-        #
-        #
-        # # merge windows
-        # attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        # shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
-        #
-        # # reverse cyclic shift
-        # if self.shift_size > 0:
-        #   x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        # else:
-        #    x = shifted_x
-        # x = x.view(B, H * W, C)
-
         # 直接在整个特征图上应用MDTA
         x = x.view(B, H * W, C)
         mdta_x = self.mdta(x.permute(0, 2, 1).view(B, C, H, W))  # MDTA需要(B,C,H,W)输入
@@ -296,7 +285,21 @@ class ContextAwareTransformer(nn.Module):
 
         # FFN
         x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        shortcut_gdfn = x
+
+        # 新增形状转换
+        x = self.norm2(x)
+        x = x.view(B, H, W, C).permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+
+        # 使用GDFN代替原有MLP
+        x = self.gdfn(x)
+
+        # 形状恢复
+        x = x.permute(0, 2, 3, 1).view(B, H * W, C)  # (B, C, H, W) -> (B, L, C)
+
+        # 残差连接
+        x = shortcut_gdfn + self.drop_path(x)
+
         # local context
         lc = self.lce(lcf)
         lc = lc.view(B, C, H * W).permute(0, 2, 1)
